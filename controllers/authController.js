@@ -4,20 +4,44 @@ const prisma = require('../config/db');
 
 // ===================================================================
 // *** HELPER: Extract School Code from Subdomain ***
+// ✅ FIXED: *.vercel.app hosts must NEVER be treated as school subdomains.
+//    On Vercel the "subdomain" is just the PROJECT NAME (aback-xi,
+//    hybridsys-pi), which was silently overwriting the schoolCode sent
+//    by the mobile/web login form → "Invalid school portal."
+//    Now only YOUR base domains can carry a school subdomain, and only
+//    when one actually exists (apex domains like okispecial.com.ng → null).
 // ===================================================================
+const SCHOOL_DOMAIN_SUFFIXES = [
+    '.okispecial.com.ng',
+    '.fountainhillsschools.com.ng',
+    '.lvh.me',   // local dev: fountainhills.lvh.me
+    '.nip.io',   // local dev: fountainhills.192.168.x.x.nip.io
+];
+
 const getSchoolCodeFromSubdomain = (req) => {
-    const host = req.headers.host || req.headers['x-forwarded-host'] || '';
-    
-    // Ignore localhost and raw IP addresses
-    if (host.includes('localhost') || host.match(/^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/)) {
+    let host = (req.headers['x-forwarded-host'] || req.headers.host || '')
+        .toLowerCase().trim();
+    host = host.split(':')[0]; // drop :port
+
+    // Ignore localhost and raw IP addresses (local/LAN server)
+    if (host.includes('localhost') || host.match(/^(\d{1,3}\.){3}\d{1,3}$/)) {
         return null;
     }
-    
-    const parts = host.split('.');
-    if (parts.length >= 3 && parts[0] !== 'www') {
-        return parts[0].toLowerCase().trim(); 
+
+    // ✅ Never treat Vercel's own domains as school subdomains
+    if (host.endsWith('.vercel.app')) {
+        return null;
     }
-    return null; 
+
+    // ✅ Only whitelisted base domains can carry a school subdomain
+    const suffix = SCHOOL_DOMAIN_SUFFIXES.find(s => host.endsWith(s));
+    if (!suffix) return null;
+
+    const sub = host.slice(0, host.length - suffix.length);
+    if (sub && sub !== 'www' && !sub.includes('.')) {
+        return sub.toLowerCase().trim();
+    }
+    return null; // apex domain (no subdomain) → let the body's schoolCode be used
 };
 
 // ===================================================================
@@ -51,7 +75,7 @@ exports.login = async (req, res) => {
         
         // --- SUPERADMIN LOGIN ---
         if (role === 'superadmin') {
-            const cleanUsername = String(credentials.username || '').trim();   // ✅ NEW: trim
+            const cleanUsername = String(credentials.username || '').trim();   // ✅ trim
             user = await prisma.superAdmin.findFirst({ where: { username: { equals: cleanUsername, mode: 'insensitive' } } });
             if (!user) return res.status(401).json({ success: false, message: 'SuperAdmin not found' });
 
@@ -71,7 +95,7 @@ exports.login = async (req, res) => {
         
         // --- ADMIN LOGIN (No School Code Required) ---
         else if (role === 'admin') {
-            const cleanUsername = String(credentials.username || '').trim();   // ✅ NEW: trim — phone keyboards append spaces
+            const cleanUsername = String(credentials.username || '').trim();   // ✅ trim — phone keyboards append spaces
             user = await prisma.admin.findFirst({ 
                 where: { 
                     username: { equals: cleanUsername, mode: 'insensitive' }
@@ -134,7 +158,7 @@ exports.login = async (req, res) => {
                 return res.status(403).json({ success: false, message: 'This school portal is currently deactivated. Please contact the SuperAdmin.' });
             }
 
-            const cleanUsername = String(credentials.username || '').trim();   // ✅ NEW: trim
+            const cleanUsername = String(credentials.username || '').trim();   // ✅ trim
             user = await prisma.teacher.findFirst({ where: { username: { equals: cleanUsername, mode: 'insensitive' }, adminId: school.id } });
             if (!user) return res.status(401).json({ success: false, message: 'Teacher not found' });
 
@@ -192,7 +216,7 @@ exports.login = async (req, res) => {
                 return res.status(403).json({ success: false, message: 'This school portal is currently deactivated. Please contact the SuperAdmin.' });
             }
 
-            // ✅ NEW: trim (matches the dedicated student handler)
+            // ✅ trim (matches the dedicated student handler)
             const cleanAdmissionNumber = String(credentials.admissionNumber || '').trim();
             const cleanFirstName = String(credentials.firstName || '').trim();
 
@@ -255,7 +279,7 @@ exports.loginSuperAdmin = async (req, res) => {
     if (!username || !password) return res.status(400).json({ success: false, message: 'Username and password are required.' });
 
     try {
-        const cleanUsername = String(username).trim();   // ✅ NEW: trim
+        const cleanUsername = String(username).trim();   // ✅ trim
         const superAdmin = await prisma.superAdmin.findFirst({ where: { username: { equals: cleanUsername, mode: 'insensitive' } } });
         if (!superAdmin) return res.status(401).json({ success: false, message: 'Invalid credentials.' });
 
@@ -294,7 +318,7 @@ exports.loginAdmin = async (req, res) => {
 
         if (!schoolCode) return res.status(400).json({ success: false, message: 'Please login via your school portal link.' });
 
-        const cleanUsername = String(username).trim();   // ✅ NEW: trim
+        const cleanUsername = String(username).trim();   // ✅ trim
         const admin = await prisma.admin.findFirst({ 
             where: { 
                 username: { equals: cleanUsername, mode: 'insensitive' }, 
@@ -357,6 +381,9 @@ exports.loginTeacher = async (req, res) => {
 
         if (!schoolCode) return res.status(400).json({ success: false, message: 'Please login via your school portal link.' });
 
+        // ✅ DEBUG: shows exactly which code is being used (check Vercel → Functions logs)
+        console.log(`[TEACHER LOGIN] host=${req.headers.host} bodyCode=${bodyCode} subdomainCode=${subdomainCode} final=${schoolCode}`);
+
         const school = await prisma.admin.findFirst({ 
             where: { schoolCode: { equals: schoolCode, mode: 'insensitive' } } 
         });
@@ -366,7 +393,7 @@ exports.loginTeacher = async (req, res) => {
             return res.status(403).json({ success: false, message: 'This school portal is currently deactivated. Please contact the SuperAdmin.' });
         }
 
-        const cleanUsername = String(username).trim();   // ✅ NEW: trim
+        const cleanUsername = String(username).trim();   // ✅ trim
         const teacher = await prisma.teacher.findFirst({ where: { username: { equals: cleanUsername, mode: 'insensitive' }, adminId: school.id } });
         if (!teacher) return res.status(401).json({ success: false, message: 'Invalid credentials.' });
 
@@ -427,6 +454,9 @@ exports.loginStudent = async (req, res) => {
         if (subdomainCode) schoolCode = subdomainCode;
 
         if (!schoolCode) return res.status(400).json({ success: false, message: 'Please login via your school portal link.' });
+
+        // ✅ DEBUG: shows exactly which code is being used
+        console.log(`[STUDENT LOGIN] host=${req.headers.host} bodyCode=${bodyCode} subdomainCode=${subdomainCode} final=${schoolCode}`);
 
         const school = await prisma.admin.findFirst({ 
             where: { schoolCode: { equals: schoolCode, mode: 'insensitive' } } 
