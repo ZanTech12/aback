@@ -2,417 +2,468 @@ const prisma = require('../config/db');
 const { getTenantFilter } = require('../utils/helpers');
 
 // Helper to safely get Admin ID
-const getAdminId = (req) => {
-    if (req.user.role === 'admin') return parseInt(req.user.id);
-    if (req.user.role === 'teacher' || req.user.role === 'student') return parseInt(req.user.adminId);
-    // Superadmins must pass adminId in the body/query to create an assignment for a specific school
-    if (req.user.role === 'superadmin' && req.body.adminId) return parseInt(req.body.adminId);
-    return null;
+const getAdminId = (req) => req.user.role === 'admin' ? parseInt(req.user.id) : parseInt(req.user.adminId);
+
+// Helper: Calculate grade based on grading system
+const calculateGrade = async (score, adminId) => {
+    const gradingSystem = await prisma.gradingSystem.findFirst({ 
+        where: { adminId, isDefault: true, isActive: true } 
+    }) || await prisma.gradingSystem.findFirst({ 
+        where: { adminId, isActive: true } 
+    });
+
+    if (!gradingSystem) {
+        if (score >= 70) return { grade: 'A', remark: 'Excellent' };
+        if (score >= 60) return { grade: 'B', remark: 'Very Good' };
+        if (score >= 50) return { grade: 'C', remark: 'Good' };
+        if (score >= 40) return { grade: 'D', remark: 'Fair' };
+        return { grade: 'F', remark: 'Poor' };
+    }
+    
+    // Prisma stores arrays as JSON. We parse it to loop through.
+    const grades = gradingSystem.grades || [];
+    const gradeEntry = grades.find(g => score >= g.minScore && score <= g.maxScore);
+    return gradeEntry ? { grade: gradeEntry.grade, remark: gradeEntry.remark || '' } : { grade: 'F', remark: 'Poor' };
 };
 
-// Helper to check for valid Int
-const isValidId = (id) => {
-    const parsed = parseInt(id);
-    return !isNaN(parsed);
-};
-
-// Helper to fetch related Teacher, Class, and Subject for an array of assignments
-const populateAssignmentRelations = async (assignments, adminId) => {
-    if (!assignments || assignments.length === 0) return [];
-
-    const teacherIds = [...new Set(assignments.map(a => a.teacherId).filter(Boolean))];
-    const classIds = [...new Set(assignments.map(a => a.classId).filter(Boolean))];
-    const subjectIds = [...new Set(assignments.map(a => a.subjectId).filter(Boolean))];
-
-    const [teachers, classes, subjects] = await Promise.all([
-        prisma.teacher.findMany({ where: { id: { in: teacherIds }, ...(adminId ? { adminId } : {}) } }),
-        prisma.class.findMany({ where: { id: { in: classIds }, ...(adminId ? { adminId } : {}) } }),
-        prisma.subject.findMany({ where: { id: { in: subjectIds }, ...(adminId ? { adminId } : {}) } })
-    ]);
-
-    const teacherMap = new Map(teachers.map(t => [t.id, t]));
-    const classMap = new Map(classes.map(c => [c.id, c]));
-    const subjectMap = new Map(subjects.map(s => [s.id, s]));
-
-    return assignments.map(a => ({
-        ...a,
-        teacher_id: a.teacherId ? { ...teacherMap.get(a.teacherId), _id: a.teacherId } : null,
-        class_id: a.classId ? { ...classMap.get(a.classId), _id: a.classId } : null,
-        subject_id: a.subjectId ? { ...subjectMap.get(a.subjectId), _id: a.subjectId } : null,
-    }));
-};
-
-exports.getAssignments = async (req, res) => {
+// GET - Get CA entries
+exports.getCAs = async (req, res) => {
     try {
         const query = { ...getTenantFilter(req), isActive: true };
-        
-        if (req.user.role === 'teacher') {
-            query.teacherId = parseInt(req.user.id);
-        } else if (!['admin', 'superadmin'].includes(req.user.role)) {
-            return res.status(403).json({ success: false, message: 'Access denied.' });
-        }
+        if (req.user.role === 'teacher') query.teacherId = parseInt(req.user.id);
 
-        const teacherIdParam = req.query.teacherId || req.query.teacher_id;
-        const classIdParam = req.query.classId || req.query.class_id;
-        const subjectIdParam = req.query.subjectId || req.query.subject_id;
-
-        if (teacherIdParam && isValidId(teacherIdParam)) query.teacherId = parseInt(teacherIdParam);
-        if (classIdParam && isValidId(classIdParam)) query.classId = parseInt(classIdParam);
-        if (subjectIdParam && isValidId(subjectIdParam)) query.subjectId = parseInt(subjectIdParam);
-
-        const assignments = await prisma.teacherAssignment.findMany({
+        const assessments = await prisma.continuousAssessment.findMany({
             where: query,
             orderBy: { createdAt: 'desc' }
         });
 
-        const adminId = getAdminId(req);
-        const populatedAssignments = await populateAssignmentRelations(assignments, adminId);
+        if (assessments.length === 0) return res.json({ success: true, data: [] });
 
-        const tenantFilter = getTenantFilter(req);
+        // Fetch related data in parallel (replaces Mongoose .populate)
+        const studentIds = [...new Set(assessments.map(a => a.studentId))];
+        const classIds = [...new Set(assessments.map(a => a.classId))];
+        const subjectIds = [...new Set(assessments.map(a => a.subjectId))];
+        const termIds = [...new Set(assessments.map(a => a.termId))];
+        const sessionIds = [...new Set(assessments.map(a => a.sessionId))];
+        const teacherIds = [...new Set(assessments.map(a => a.teacherId))];
 
-        const formattedAssignments = await Promise.all(populatedAssignments.map(async (assignment) => {
-            const questionCount = await prisma.question.count({ 
-                where: { ...tenantFilter, teacherId: assignment.teacherId, subjectId: assignment.subjectId, classId: assignment.classId } 
-            });
-            const testCount = await prisma.test.count({ 
-                where: { ...tenantFilter, classId: assignment.classId, subjectId: assignment.subjectId, createdById: assignment.teacherId, isActive: true } 
-            });
+        const [students, classes, subjects, terms, sessions, teachers] = await Promise.all([
+            prisma.student.findMany({ where: { id: { in: studentIds } } }),
+            prisma.class.findMany({ where: { id: { in: classIds } } }),
+            prisma.subject.findMany({ where: { id: { in: subjectIds } } }),
+            prisma.term.findMany({ where: { id: { in: termIds } } }),
+            prisma.session.findMany({ where: { id: { in: sessionIds } } }),
+            prisma.teacher.findMany({ where: { id: { in: teacherIds } } })
+        ]);
 
-            return {
-                id: assignment.id,
-                teacher_id: assignment.teacher_id, teacherId: assignment.teacher_id,
-                teacher_name: assignment.teacher_id ? `${assignment.teacher_id.firstName} ${assignment.teacher_id.lastName}` : 'Unknown',
-                teacher_email: assignment.teacher_id ? assignment.teacher_id.email : '',
-                teacher_username: assignment.teacher_id ? assignment.teacher_id.username : '',
-                class_id: assignment.class_id, classId: assignment.class_id,
-                class_name: assignment.class_id ? `${assignment.class_id.name} ${assignment.class_id.section || ''}`.trim() : 'Unknown',
-                class_level: assignment.class_id ? assignment.class_id.level : '',
-                subject_id: assignment.subject_id, subjectId: assignment.subject_id,
-                subject_name: assignment.subject_id ? assignment.subject_id.name : 'Unknown',
-                subject_code: assignment.subject_id ? assignment.subject_id.code : '',
-                question_count: questionCount, test_count: testCount,
-                is_active: assignment.isActive, created_at: assignment.createdAt, updated_at: assignment.updatedAt
-            };
+        // Create Maps for fast lookup
+        const mapById = (arr) => new Map(arr.map(item => [item.id, item]));
+        const studentMap = mapById(students);
+        const classMap = mapById(classes);
+        const subjectMap = mapById(subjects);
+        const termMap = mapById(terms);
+        const sessionMap = mapById(sessions);
+        const teacherMap = mapById(teachers);
+
+        // Attach relations manually
+        const populatedAssessments = assessments.map(a => ({
+            ...a,
+            studentId: studentMap.get(a.studentId) || null,
+            classId: classMap.get(a.classId) || null,
+            subjectId: subjectMap.get(a.subjectId) || null,
+            termId: termMap.get(a.termId) || null,
+            sessionId: sessionMap.get(a.sessionId) || null,
+            teacherId: teacherMap.get(a.teacherId) || null,
         }));
 
-        res.json({ success: true, data: formattedAssignments });
+        res.json({ success: true, data: populatedAssessments });
     } catch (error) {
+        console.error('Error fetching continuous assessments:', error);
         res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
     }
 };
 
-exports.getAssignmentCount = async (req, res) => {
+// GET - Classes and subjects teacher can upload CA for
+exports.getTeacherCAEligible = async (req, res) => {
     try {
-        const query = { ...getTenantFilter(req), isActive: true };
-        if (req.user.role === 'teacher') query.teacherId = parseInt(req.user.id);
-        else if (!['admin', 'superadmin'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'Access denied.' });
-
-        const teacherIdParam = req.query.teacherId || req.query.teacher_id;
-        const classIdParam = req.query.classId || req.query.class_id;
-        const subjectIdParam = req.query.subjectId || req.query.subject_id;
-
-        if (teacherIdParam && isValidId(teacherIdParam)) query.teacherId = parseInt(teacherIdParam);
-        if (classIdParam && isValidId(classIdParam)) query.classId = parseInt(classIdParam);
-        if (subjectIdParam && isValidId(subjectIdParam)) query.subjectId = parseInt(subjectIdParam);
-
-        const count = await prisma.teacherAssignment.count({ where: query });
-        res.json({ success: true, count });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
-};
-
-exports.getAssignmentById = async (req, res) => {
-    try {
-        if (!isValidId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid ID format.' });
-        const assignmentId = parseInt(req.params.id);
-        const tenantFilter = getTenantFilter(req);
-
-        const assignment = await prisma.teacherAssignment.findFirst({ where: { ...tenantFilter, id: assignmentId } });
-
-        if (!assignment) return res.status(404).json({ success: false, message: 'Assignment not found.' });
-
-        const adminId = getAdminId(req);
-        const [populatedAssignmentArr] = await populateAssignmentRelations([assignment], adminId);
-        const populatedAssignment = populatedAssignmentArr;
-
-        if (req.user.role === 'teacher' && populatedAssignment.teacher_id?._id !== parseInt(req.user.id)) {
-            return res.status(403).json({ success: false, message: 'Access denied.' });
-        }
-
-        const questionCount = await prisma.question.count({ 
-            where: { ...tenantFilter, teacherId: assignment.teacherId, subjectId: assignment.subjectId, classId: assignment.classId } 
-        });
-        const testCount = await prisma.test.count({ 
-            where: { ...tenantFilter, classId: assignment.classId, subjectId: assignment.subjectId, createdById: assignment.teacherId, isActive: true } 
-        });
-
-        const formattedAssignment = {
-            id: assignment.id,
-            teacher_id: populatedAssignment.teacher_id, teacherId: populatedAssignment.teacher_id,
-            teacher_name: populatedAssignment.teacher_id ? `${populatedAssignment.teacher_id.firstName} ${populatedAssignment.teacher_id.lastName}` : 'Unknown',
-            class_id: populatedAssignment.class_id, classId: populatedAssignment.class_id,
-            class_name: populatedAssignment.class_id ? `${populatedAssignment.class_id.name} ${populatedAssignment.class_id.section || ''}`.trim() : 'Unknown',
-            subject_id: populatedAssignment.subject_id, subjectId: populatedAssignment.subject_id,
-            subject_name: populatedAssignment.subject_id ? populatedAssignment.subject_id.name : 'Unknown',
-            question_count: questionCount, test_count: testCount,
-            is_active: assignment.isActive
-        };
-
-        res.json({ success: true, data: formattedAssignment });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
-    }
-};
-
-exports.getAssignmentsByTeacher = async (req, res) => {
-    try {
-        if (req.user.role === 'teacher' && parseInt(req.user.id) !== parseInt(req.params.teacherId)) return res.status(403).json({ success: false, message: 'Access denied.' });
-        if (!isValidId(req.params.teacherId)) return res.status(400).json({ success: false, message: 'Invalid teacher ID format.' });
-
-        const teacherId = parseInt(req.params.teacherId);
-        const tenantFilter = getTenantFilter(req);
+        if (req.user.role !== 'teacher') return res.status(403).json({ success: false, message: 'Access denied. Teacher role required.' });
 
         const assignments = await prisma.teacherAssignment.findMany({ 
-            where: { ...tenantFilter, teacherId, isActive: true },
-            orderBy: { createdAt: 'desc' }
+            where: { ...getTenantFilter(req), teacherId: parseInt(req.user.id), isActive: true } 
         });
 
-        const adminId = getAdminId(req);
-        const populatedAssignments = await populateAssignmentRelations(assignments, adminId);
+        if (assignments.length === 0) {
+            return res.json({ success: true, data: [], message: 'No class-subject assignments found. Contact admin.' });
+        }
+        
+        const classIds = [...new Set(assignments.map(a => a.classId))];
+        const subjectIds = [...new Set(assignments.map(a => a.subjectId))];
 
-        const formattedAssignments = await Promise.all(populatedAssignments.map(async (assignment) => {
-            const questionCount = await prisma.question.count({ 
-                where: { ...tenantFilter, teacherId: assignment.teacherId, subjectId: assignment.subjectId, classId: assignment.classId } 
-            });
-            const testCount = await prisma.test.count({ 
-                where: { ...tenantFilter, classId: assignment.classId, subjectId: assignment.subjectId, createdById: assignment.teacherId, isActive: true } 
-            });
-            return {
-                id: assignment.id,
-                teacher_id: assignment.teacher_id, teacherId: assignment.teacher_id,
-                teacher_name: assignment.teacher_id ? `${assignment.teacher_id.firstName} ${assignment.teacher_id.lastName}` : 'Unknown',
-                class_id: assignment.class_id, classId: assignment.class_id,
-                class_name: assignment.class_id ? `${assignment.class_id.name} ${assignment.class_id.section || ''}`.trim() : 'Unknown',
-                subject_id: assignment.subject_id, subjectId: assignment.subject_id,
-                subject_name: assignment.subject_id ? assignment.subject_id.name : 'Unknown',
-                question_count: questionCount, test_count: testCount
-            };
-        }));
+        const [classes, subjects] = await Promise.all([
+            prisma.class.findMany({ where: { id: { in: classIds } } }),
+            prisma.subject.findMany({ where: { id: { in: subjectIds } } })
+        ]);
 
-        res.json({ success: true, data: formattedAssignments });
+        const classMap = new Map(classes.map(c => [c.id, c]));
+        const subjectMap = new Map(subjects.map(s => [s.id, s]));
+
+        const groupedByClass = {};
+        for (const assignment of assignments) {
+            const classData = classMap.get(assignment.classId);
+            if (!classData) continue;
+
+            if (!groupedByClass[assignment.classId]) {
+                groupedByClass[assignment.classId] = {
+                    classId: assignment.classId,
+                    className: classData.name,
+                    classLevel: classData.level,
+                    classSection: classData.section,
+                    classSession: classData.session,
+                    subjects: []
+                };
+            }
+            
+            const subjectData = subjectMap.get(assignment.subjectId);
+            groupedByClass[assignment.classId].subjects.push({
+                subjectId: assignment.subjectId,
+                subjectName: subjectData?.name || 'Unknown',
+                subjectCode: subjectData?.code || 'N/A',
+                assignmentId: assignment.id
+            });
+        }
+
+        const result = Object.values(groupedByClass);
+        res.json({ success: true, data: result, message: `Found ${result.length} class(es) with ${assignments.length} subject assignment(s)` });
     } catch (error) {
+        console.error('[TEACHER CA ELIGIBLE] Error:', error);
         res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
     }
 };
 
-exports.getAssignmentsByClass = async (req, res) => {
+// GET - Students in a class for CA upload
+exports.getTeacherCAStudents = async (req, res) => {
     try {
-        if (!['admin', 'superadmin', 'teacher'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'Access denied.' });
-        if (!isValidId(req.params.classId)) return res.status(400).json({ success: false, message: 'Invalid class ID format.' });
+        if (req.user.role !== 'teacher') return res.status(403).json({ success: false, message: 'Access denied. Teacher role required.' });
 
         const classId = parseInt(req.params.classId);
+        const subjectId = parseInt(req.params.subjectId);
+        const { termId, sessionId } = req.query;
         const tenantFilter = getTenantFilter(req);
 
-        const assignments = await prisma.teacherAssignment.findMany({ 
-            where: { ...tenantFilter, classId, isActive: true },
-            orderBy: { createdAt: 'desc' }
+        const assignment = await prisma.teacherAssignment.findFirst({ 
+            where: { ...tenantFilter, teacherId: parseInt(req.user.id), classId, subjectId, isActive: true } 
+        });
+        if (!assignment) return res.status(403).json({ success: false, message: 'Access denied. You are not assigned to this class and subject.' });
+
+        const students = await prisma.student.findMany({ 
+            where: { ...tenantFilter, classId, isDeleted: { not: true } },
+            select: { id: true, firstName: true, lastName: true, admissionNumber: true, gender: true },
+            orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }]
         });
 
-        const adminId = getAdminId(req);
-        const populatedAssignments = await populateAssignmentRelations(assignments, adminId);
+        if (students.length === 0) return res.json({ success: true, data: [], classInfo: null, subjectInfo: null, message: 'No students found in this class.' });
 
-        const formattedAssignments = await Promise.all(populatedAssignments.map(async (assignment) => {
-            const questionCount = await prisma.question.count({ 
-                where: { ...tenantFilter, teacherId: assignment.teacherId, subjectId: assignment.subjectId, classId: assignment.classId } 
-            });
+        const classInfo = await prisma.class.findUnique({ where: { id: classId } });
+        const subjectInfo = await prisma.subject.findUnique({ where: { id: subjectId } });
+
+        let term = termId 
+            ? await prisma.term.findFirst({ where: { ...tenantFilter, id: parseInt(termId) } }) 
+            : await prisma.term.findFirst({ where: { ...tenantFilter, status: 'active', isActive: true } });
+            
+        if (!term) term = await prisma.term.findFirst({ where: { ...tenantFilter, isActive: true }, orderBy: { startDate: 'desc' } });
+
+        let session = sessionId 
+            ? await prisma.session.findFirst({ where: { ...tenantFilter, id: parseInt(sessionId) } }) 
+            : (term?.sessionId ? await prisma.session.findFirst({ where: { ...tenantFilter, id: term.sessionId } }) : null);
+            
+        if (!session) session = await prisma.session.findFirst({ where: { ...tenantFilter, isActive: true }, orderBy: { name: 'desc' } });
+
+        const studentIds = students.map(s => s.id);
+        const existingCA = await prisma.continuousAssessment.findMany({ 
+            where: { ...tenantFilter, studentId: { in: studentIds }, classId, subjectId, termId: term?.id || 0, sessionId: session?.id || 0 } 
+        });
+        
+        const caMap = {};
+        existingCA.forEach(ca => caMap[ca.studentId] = ca);
+
+        const studentsWithCA = students.map(student => {
+            const existing = caMap[student.id];
             return {
-                id: assignment.id,
-                teacher_id: assignment.teacher_id, teacherId: assignment.teacher_id,
-                teacher_name: assignment.teacher_id ? `${assignment.teacher_id.firstName} ${assignment.teacher_id.lastName}` : 'Unknown',
-                class_id: assignment.class_id, classId: assignment.class_id,
-                class_name: assignment.class_id ? `${assignment.class_id.name} ${assignment.class_id.section || ''}`.trim() : 'Unknown',
-                subject_id: assignment.subject_id, subjectId: assignment.subject_id,
-                subject_name: assignment.subject_id ? assignment.subject_id.name : 'Unknown',
-                question_count: questionCount
+                studentId: student.id,
+                firstName: student.firstName,
+                lastName: student.lastName,
+                admissionNumber: student.admissionNumber,
+                gender: student.gender,
+                existingCA: existing ? {
+                    id: existing.id, testScore: existing.testScore, noteTakingScore: existing.noteTakingScore, assignmentScore: existing.assignmentScore, totalCA: existing.totalCA, examScore: existing.examScore, totalScore: existing.totalScore, grade: existing.grade, remark: existing.remark, status: existing.status
+                } : null
             };
-        }));
+        });
 
-        res.json({ success: true, data: formattedAssignments });
+        res.json({
+            success: true, data: studentsWithCA, classInfo, subjectInfo,
+            termInfo: term ? { id: term.id, name: term.name, status: term.status } : null,
+            sessionInfo: session ? { id: session.id, name: session.name } : null,
+            stats: { totalStudents: students.length, withExistingCA: existingCA.length, withoutCA: students.length - existingCA.length }
+        });
+    } catch (error) {
+        console.error('[TEACHER CA STUDENTS] Error:', error);
+        res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+    }
+};
+
+// POST - Upload CA for single student
+exports.uploadCA = async (req, res) => {
+    try {
+        if (req.user.role !== 'teacher') return res.status(403).json({ success: false, message: 'Access denied. Teacher role required.' });
+
+        const { studentId, classId, subjectId, termId, sessionId, testScore, noteTakingScore, assignmentScore, examScore } = req.body;
+        if (!studentId || !classId || !subjectId || !termId || !sessionId) return res.status(400).json({ success: false, message: 'Student, Class, Subject, Term, and Session are required.' });
+
+        const tenantFilter = getTenantFilter(req);
+        const adminId = getAdminId(req);
+
+        const assignment = await prisma.teacherAssignment.findFirst({ 
+            where: { ...tenantFilter, teacherId: parseInt(req.user.id), classId: parseInt(classId), subjectId: parseInt(subjectId), isActive: true } 
+        });
+        if (!assignment) return res.status(403).json({ success: false, message: 'Access denied. You are not assigned to this class and subject combination.' });
+
+        const student = await prisma.student.findFirst({ 
+            where: { ...tenantFilter, id: parseInt(studentId), classId: parseInt(classId) } 
+        });
+        if (!student) return res.status(404).json({ success: false, message: 'Student not found or not enrolled in this class.' });
+
+        const validateScore = (score, max) => score === undefined || score === null ? 0 : Math.min(Math.max(Number(score) || 0, 0), max);
+        const vTest = validateScore(testScore, 20);
+        const vNote = validateScore(noteTakingScore, 10);
+        const vAssign = validateScore(assignmentScore, 10);
+        const vExam = validateScore(examScore, 60);
+
+        const totalCA = vTest + vNote + vAssign;
+        const totalScore = totalCA + vExam;
+        
+        const { grade, remark } = await calculateGrade(totalScore, adminId); 
+
+        const existingCA = await prisma.continuousAssessment.findFirst({ 
+            where: { ...tenantFilter, studentId: parseInt(studentId), subjectId: parseInt(subjectId), termId: parseInt(termId), sessionId: parseInt(sessionId) } 
+        });
+
+        if (existingCA && existingCA.status === 'approved') {
+            return res.status(400).json({ success: false, message: 'Cannot modify approved assessment. Contact admin.' });
+        }
+
+        let assessment;
+        if (existingCA) {
+            assessment = await prisma.continuousAssessment.update({
+                where: { id: existingCA.id },
+                data: {
+                    testScore: vTest, noteTakingScore: vNote, assignmentScore: vAssign,
+                    totalCA, examScore: vExam, totalScore,
+                    grade, remark, teacherId: parseInt(req.user.id),
+                    classId: parseInt(classId), status: 'draft'
+                }
+            });
+        } else {
+            assessment = await prisma.continuousAssessment.create({
+                data: {
+                    ...tenantFilter,
+                    studentId: parseInt(studentId), classId: parseInt(classId), subjectId: parseInt(subjectId), 
+                    termId: parseInt(termId), sessionId: parseInt(sessionId), teacherId: parseInt(req.user.id),
+                    testScore: vTest, noteTakingScore: vNote, assignmentScore: vAssign, totalCA,
+                    examScore: vExam, totalScore, grade, remark, status: 'draft'
+                }
+            });
+        }
+
+        // Re-fetch with populated data
+        const [stu, cls, sub, ter, ses] = await Promise.all([
+            prisma.student.findUnique({ where: { id: assessment.studentId } }),
+            prisma.class.findUnique({ where: { id: assessment.classId } }),
+            prisma.subject.findUnique({ where: { id: assessment.subjectId } }),
+            prisma.term.findUnique({ where: { id: assessment.termId } }),
+            prisma.session.findUnique({ where: { id: assessment.sessionId } })
+        ]);
+
+        const populatedAssessment = {
+            ...assessment,
+            studentId: stu,
+            classId: cls,
+            subjectId: sub,
+            termId: ter,
+            sessionId: ses
+        };
+
+        res.status(200).json({ success: true, message: 'CA uploaded successfully', data: populatedAssessment });
+    } catch (error) {
+        console.error('[TEACHER CA UPLOAD] Error:', error);
+        if (error.code === 'P2002') return res.status(400).json({ success: false, message: 'CA already exists for this student and subject.' });
+        res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+    }
+};
+
+// POST - Bulk upload CA for multiple students
+exports.bulkUploadCA = async (req, res) => {
+    try {
+        if (req.user.role !== 'teacher') return res.status(403).json({ success: false, message: 'Access denied. Teacher role required.' });
+
+        const { classId, subjectId, termId, sessionId, assessments } = req.body;
+        if (!classId || !subjectId || !termId || !sessionId || !assessments || !Array.isArray(assessments)) {
+            return res.status(400).json({ success: false, message: 'Missing required fields.' });
+        }
+
+        const tenantFilter = getTenantFilter(req);
+        const adminId = getAdminId(req);
+
+        // Verify teacher assignment
+        const assignment = await prisma.teacherAssignment.findFirst({ 
+            where: { ...tenantFilter, teacherId: parseInt(req.user.id), classId: parseInt(classId), subjectId: parseInt(subjectId), isActive: true } 
+        });
+        if (!assignment) return res.status(403).json({ success: false, message: 'Access denied. You are not assigned to this class and subject combination.' });
+
+        const validateScore = (score, max) => score === undefined || score === null ? 0 : Math.min(Math.max(Number(score) || 0, 0), max);
+        let created = 0, updated = 0, failed = 0;
+        const errors = [];
+
+        for (let i = 0; i < assessments.length; i++) {
+            const ass = assessments[i];
+            try {
+                if (!ass.studentId) { errors.push({ index: i, message: 'Missing studentId' }); failed++; continue; }
+                const parsedStudentId = parseInt(ass.studentId);
+
+                const vTest = validateScore(ass.testScore, 20);
+                const vNote = validateScore(ass.noteTakingScore, 10);
+                const vAssign = validateScore(ass.assignmentScore, 10);
+                const vExam = validateScore(ass.examScore, 60);
+
+                const totalCA = vTest + vNote + vAssign;
+                const totalScore = totalCA + vExam;
+                const { grade, remark } = await calculateGrade(totalScore, adminId);
+
+                const existingCA = await prisma.continuousAssessment.findFirst({ 
+                    where: { ...tenantFilter, studentId: parsedStudentId, classId: parseInt(classId), subjectId: parseInt(subjectId), termId: parseInt(termId), sessionId: parseInt(sessionId) } 
+                });
+
+                if (existingCA && existingCA.status === 'approved') {
+                    errors.push({ index: i, studentId: ass.studentId, message: 'Cannot modify approved assessment.' });
+                    failed++;
+                    continue;
+                }
+
+                if (existingCA) {
+                    await prisma.continuousAssessment.update({
+                        where: { id: existingCA.id },
+                        data: { testScore: vTest, noteTakingScore: vNote, assignmentScore: vAssign, totalCA, examScore: vExam, totalScore, grade, remark, status: 'draft' }
+                    });
+                    updated++;
+                } else {
+                    await prisma.continuousAssessment.create({
+                        data: { ...tenantFilter, studentId: parsedStudentId, classId: parseInt(classId), subjectId: parseInt(subjectId), termId: parseInt(termId), sessionId: parseInt(sessionId), teacherId: parseInt(req.user.id), testScore: vTest, noteTakingScore: vNote, assignmentScore: vAssign, totalCA, examScore: vExam, totalScore, grade, remark, status: 'draft' }
+                    });
+                    created++;
+                }
+            } catch (err) {
+                errors.push({ index: i, message: err.message });
+                failed++;
+            }
+        }
+
+        res.status(200).json({ success: true, message: `Bulk upload completed. Created: ${created}, Updated: ${updated}, Failed: ${failed}.`, data: { summary: { created, updated, failed, total: assessments.length }, errors } });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
     }
 };
 
-exports.createAssignment = async (req, res) => {
+// PUT - Submit CA for approval
+exports.submitForApproval = async (req, res) => {
     try {
-        if (!['admin', 'superadmin'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'Access denied. Admin role required.' });
+        if (req.user.role !== 'teacher') return res.status(403).json({ success: false, message: 'Access denied. Teacher role required.' });
 
-        const teacher_id = req.body.teacher_id || req.body.teacherId;
-        const class_id = req.body.class_id || req.body.classId;
-        const subject_id = req.body.subject_id || req.body.subjectId;
+        const classId = parseInt(req.params.classId);
+        const subjectId = parseInt(req.params.subjectId);
+        const { termId, sessionId } = req.body;
+        const tenantFilter = getTenantFilter(req);
 
-        if (!teacher_id || !class_id || !subject_id) return res.status(400).json({ success: false, message: 'Teacher, Class, and Subject are required.' });
+        // Verify teacher assignment
+        const assignment = await prisma.teacherAssignment.findFirst({ 
+            where: { ...tenantFilter, teacherId: parseInt(req.user.id), classId, subjectId, isActive: true } 
+        });
+        if (!assignment) return res.status(403).json({ success: false, message: 'Access denied. You are not assigned to this class and subject.' });
 
-        if (!isValidId(teacher_id) || !isValidId(class_id) || !isValidId(subject_id)) {
-            return res.status(400).json({ success: false, message: 'Invalid ID format.' });
-        }
-
-        const parsedTeacherId = parseInt(teacher_id);
-        const parsedClassId = parseInt(class_id);
-        const parsedSubjectId = parseInt(subject_id);
-
-        const adminId = getAdminId(req);
-
-        // If SuperAdmin didn't pass adminId in body, they can't create an assignment
-        if (!adminId || isNaN(adminId)) {
-            return res.status(400).json({ success: false, message: 'Admin ID is required to create an assignment.' });
-        }
-
-        const [teacherExists, classExists, subjectExists] = await Promise.all([
-            prisma.teacher.findFirst({ where: { adminId, id: parsedTeacherId } }), 
-            prisma.class.findFirst({ where: { adminId, id: parsedClassId } }), 
-            prisma.subject.findFirst({ where: { adminId, id: parsedSubjectId } })
-        ]);
-        
-        if (!teacherExists) return res.status(404).json({ success: false, message: 'Teacher not found.' });
-        if (!classExists) return res.status(404).json({ success: false, message: 'Class not found.' });
-        if (!subjectExists) return res.status(404).json({ success: false, message: 'Subject not found.' });
-        if (!classExists.isActive) return res.status(400).json({ success: false, message: 'Cannot assign to an inactive class.' });
-
-        const newAssignment = await prisma.teacherAssignment.create({
+        // Update all draft CAs for this class/subject/term/session to 'submitted'
+        const result = await prisma.continuousAssessment.updateMany({
+            where: { 
+                ...tenantFilter, 
+                classId, 
+                subjectId, 
+                termId: parseInt(termId), 
+                sessionId: parseInt(sessionId), 
+                status: 'draft',
+                isActive: true 
+            },
             data: { 
-                adminId, 
-                teacherId: parsedTeacherId, 
-                classId: parsedClassId, 
-                subjectId: parsedSubjectId 
+                status: 'submitted'
             }
         });
 
-        const [populatedAssignment] = await populateAssignmentRelations([newAssignment], adminId);
-
-        res.status(201).json({ success: true, message: 'Assignment created successfully', data: populatedAssignment });
+        res.json({ success: true, message: `${result.count} draft assessment(s) submitted for approval`, data: { submitted: result.count } });
     } catch (error) {
-        if (error.code === 'P2002') return res.status(409).json({ success: false, message: 'This teacher is already assigned to this class and subject.' });
         res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
     }
 };
 
-exports.updateAssignment = async (req, res) => {
+// ===================================================================
+// ✅ NEW: DELETE - Delete a draft/submitted CA entry
+// Teacher can only delete entries for their OWN assigned
+// class + subject. Approved entries are locked.
+// ===================================================================
+exports.deleteDraftCA = async (req, res) => {
     try {
-        if (!['admin', 'superadmin'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'Access denied. Admin role required.' });
-        
-        if (!isValidId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid ID format.' });
-        const assignmentId = parseInt(req.params.id);
+        if (req.user.role !== 'teacher') return res.status(403).json({ success: false, message: 'Access denied. Teacher role required.' });
 
-        const assignment = await prisma.teacherAssignment.findFirst({ where: { ...getTenantFilter(req), id: assignmentId } });
-        if (!assignment) return res.status(404).json({ success: false, message: 'Assignment not found.' });
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return res.status(400).json({ success: false, message: 'Invalid ID format.' });
 
-        const dataToUpdate = {};
-        
-        const teacher_id = req.body.teacher_id !== undefined ? (req.body.teacher_id || req.body.teacherId) : undefined;
-        const class_id = req.body.class_id !== undefined ? (req.body.class_id || req.body.classId) : undefined;
-        const subject_id = req.body.subject_id !== undefined ? (req.body.subject_id || req.body.subjectId) : undefined;
-        const isActive = req.body.isActive !== undefined ? req.body.isActive : (req.body.is_active !== undefined ? req.body.is_active : undefined);
+        const tenantFilter = getTenantFilter(req);
 
-        if (teacher_id && isValidId(teacher_id)) dataToUpdate.teacherId = parseInt(teacher_id);
-        if (class_id && isValidId(class_id)) dataToUpdate.classId = parseInt(class_id);
-        if (subject_id && isValidId(subject_id)) dataToUpdate.subjectId = parseInt(subject_id);
-        if (typeof isActive === 'boolean') dataToUpdate.isActive = isActive;
-
-        const updatedAssignment = await prisma.teacherAssignment.update({
-            where: { id: assignmentId },
-            data: dataToUpdate
+        // 1. Load the CA entry
+        const existingCA = await prisma.continuousAssessment.findFirst({ 
+            where: { ...tenantFilter, id, isActive: true } 
         });
+        if (!existingCA) return res.status(404).json({ success: false, message: 'CA entry not found.' });
 
-        const adminId = getAdminId(req);
-        const [populatedAssignment] = await populateAssignmentRelations([updatedAssignment], adminId);
+        // 2. Approved entries are locked
+        if (existingCA.status === 'approved') {
+            return res.status(400).json({ success: false, message: 'Cannot delete an approved assessment. Contact admin.' });
+        }
 
-        res.json({ success: true, message: 'Assignment updated successfully', data: populatedAssignment });
-    } catch (error) {
-        if (error.code === 'P2002') return res.status(409).json({ success: false, message: 'This teacher is already assigned to this class and subject.' });
-        res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
-    }
-};
-
-exports.deleteAssignment = async (req, res) => {
-    try {
-        if (!['admin', 'superadmin'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'Access denied. Admin role required.' });
-
-        if (!isValidId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid ID format.' });
-        const assignmentId = parseInt(req.params.id);
-
-        const assignment = await prisma.teacherAssignment.findFirst({ where: { ...getTenantFilter(req), id: assignmentId } });
-        if (!assignment) return res.status(404).json({ success: false, message: 'Assignment not found.' });
-
-        await prisma.teacherAssignment.update({
-            where: { id: assignmentId },
-            data: { isActive: false }
+        // 3. Verify the teacher is assigned to this entry's class + subject
+        //    (same ownership pattern as uploadCA / bulkUploadCA)
+        const assignment = await prisma.teacherAssignment.findFirst({ 
+            where: { 
+                ...tenantFilter, 
+                teacherId: parseInt(req.user.id), 
+                classId: existingCA.classId, 
+                subjectId: existingCA.subjectId, 
+                isActive: true 
+            } 
         });
+        if (!assignment) return res.status(403).json({ success: false, message: 'Access denied. You are not assigned to this class and subject.' });
 
-        res.json({ success: true, message: 'Assignment deleted successfully' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
-    }
-};
-
-exports.permanentDeleteAssignment = async (req, res) => {
-    try {
-        if (!['admin', 'superadmin'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'Access denied. Admin role required.' });
-
-        if (!isValidId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid ID format.' });
-        const assignmentId = parseInt(req.params.id);
-
+        // 4. Hard delete (P2025 = record vanished between find and delete)
         try {
-            await prisma.teacherAssignment.delete({ where: { id: assignmentId } });
+            await prisma.continuousAssessment.delete({ where: { id: existingCA.id } });
         } catch (err) {
-            if (err.code === 'P2025') return res.status(404).json({ success: false, message: 'Assignment not found.' });
+            if (err.code === 'P2025') return res.status(404).json({ success: false, message: 'CA entry not found.' });
             throw err;
         }
 
-        res.json({ success: true, message: 'Assignment permanently deleted successfully' });
+        res.json({ 
+            success: true, 
+            message: 'CA entry deleted successfully', 
+            data: { id: existingCA.id, studentId: existingCA.studentId } 
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
-    }
-};
-
-exports.bulkCreateAssignments = async (req, res) => {
-    try {
-        if (!['admin', 'superadmin'].includes(req.user.role)) return res.status(403).json({ success: false, message: 'Access denied. Admin role required.' });
-
-        let { assignments } = req.body;
-        if (!assignments || !Array.isArray(assignments) || assignments.length === 0) return res.status(400).json({ success: false, message: 'Assignments array is required and must not be empty.' });
-
-        const adminId = getAdminId(req);
-        if (!adminId || isNaN(adminId)) {
-            return res.status(400).json({ success: false, message: 'Admin ID is required to create assignments.' });
-        }
-
-        const formattedAssignments = assignments.map(a => ({ 
-            adminId, 
-            teacherId: a.teacher_id ? parseInt(a.teacher_id) : parseInt(a.teacherId), 
-            classId: a.class_id ? parseInt(a.class_id) : parseInt(a.classId), 
-            subjectId: a.subject_id ? parseInt(a.subject_id) : parseInt(a.subjectId) 
-        })).filter(a => isValidId(a.teacherId) && isValidId(a.classId) && isValidId(a.subjectId));
-
-        const createdAssignments = [];
-        const duplicateErrors = [];
-
-        for (const assignmentData of formattedAssignments) {
-            try {
-                const assignment = await prisma.teacherAssignment.create({ data: assignmentData });
-                createdAssignments.push(assignment);
-            } catch (error) {
-                if (error.code === 'P2002') {
-                    duplicateErrors.push({ ...assignmentData, message: 'Duplicate assignment.' });
-                } else {
-                    throw error;
-                }
-            }
-        }
-
-        res.status(201).json({ success: true, message: `Created ${createdAssignments.length} assignments (${duplicateErrors.length} duplicates skipped).` });
-    } catch (error) {
+        console.error('[TEACHER CA DELETE] Error:', error);
         res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
     }
 };
