@@ -411,3 +411,60 @@ exports.submitForApproval = async (req, res) => {
         res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
     }
 };
+
+// ===================================================================
+// ✅ NEW: DELETE - Delete a draft/submitted CA entry
+// Teacher can only delete entries for their OWN assigned
+// class + subject. Approved entries are locked.
+// ===================================================================
+exports.deleteDraftCA = async (req, res) => {
+    try {
+        if (req.user.role !== 'teacher') return res.status(403).json({ success: false, message: 'Access denied. Teacher role required.' });
+
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return res.status(400).json({ success: false, message: 'Invalid ID format.' });
+
+        const tenantFilter = getTenantFilter(req);
+
+        // 1. Load the CA entry
+        const existingCA = await prisma.continuousAssessment.findFirst({ 
+            where: { ...tenantFilter, id, isActive: true } 
+        });
+        if (!existingCA) return res.status(404).json({ success: false, message: 'CA entry not found.' });
+
+        // 2. Approved entries are locked
+        if (existingCA.status === 'approved') {
+            return res.status(400).json({ success: false, message: 'Cannot delete an approved assessment. Contact admin.' });
+        }
+
+        // 3. Verify the teacher is assigned to this entry's class + subject
+        //    (same ownership pattern as uploadCA / bulkUploadCA)
+        const assignment = await prisma.teacherAssignment.findFirst({ 
+            where: { 
+                ...tenantFilter, 
+                teacherId: parseInt(req.user.id), 
+                classId: existingCA.classId, 
+                subjectId: existingCA.subjectId, 
+                isActive: true 
+            } 
+        });
+        if (!assignment) return res.status(403).json({ success: false, message: 'Access denied. You are not assigned to this class and subject.' });
+
+        // 4. Hard delete (P2025 = record vanished between find and delete)
+        try {
+            await prisma.continuousAssessment.delete({ where: { id: existingCA.id } });
+        } catch (err) {
+            if (err.code === 'P2025') return res.status(404).json({ success: false, message: 'CA entry not found.' });
+            throw err;
+        }
+
+        res.json({ 
+            success: true, 
+            message: 'CA entry deleted successfully', 
+            data: { id: existingCA.id, studentId: existingCA.studentId } 
+        });
+    } catch (error) {
+        console.error('[TEACHER CA DELETE] Error:', error);
+        res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+    }
+};
