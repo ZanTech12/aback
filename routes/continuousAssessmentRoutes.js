@@ -15,5 +15,6 @@ router.post('/teacher/ca/upload/bulk', authenticateToken, caController.bulkUploa
 
 // 👈 ADD THIS NEW ROUTE FOR SUBMITTING
 router.put('/teacher/ca/submit/:classId/:subjectId', authenticateToken, caController.submitForApproval);
+router.delete('/teacher/ca/:id', authenticateToken, caController.deleteDraftCA);
 
 module.exports = router;
