@@ -1,6 +1,6 @@
 node_modules/
 dist/
-.env
+
 *.log
 
 public
@@ -9,3 +9,7 @@ uploads
 .claude
 .cursor
 .devin
+backend/api/index.js
+server.js
+backend/server.js
+.env
