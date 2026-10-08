@@ -126,7 +126,7 @@ exports.registerAdminWithToken = async (req, res) => {
                 password: hashedPassword,
                 name,
                 schoolName: finalSchoolName,
-                schoolCode, // ✅ Saves "brainfieldcollege" to the database
+                schoolCode, // ✅ Saves "BimTechcollege" to the database
                 studentLimit: tokenRecord.studentLimit,
                 expiryDate: tokenRecord.expiryDate, // Carry over expiry set by SuperAdmin
                 isActive: true,

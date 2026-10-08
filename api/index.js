@@ -3,9 +3,7 @@ const prisma = require('../config/db');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const path = require('path');
-const os = require('os');
 const fs = require('fs');
-const { spawn } = require('child_process');
 require('dotenv').config();
 
 // Import the auth middleware
@@ -90,12 +88,48 @@ const publicDir = firstExisting([
 if (publicDir) app.use(express.static(publicDir));
 
 // ===================================================================
+// *** SERVE REACT FRONTEND — static files ***
+// (server.js resolves <backend>/../cschoolexam/build; this file sits in
+//  /api — one level deeper — so both layouts are checked.)
+// ===================================================================
+const frontendBuild = firstExisting([
+    path.join(__dirname, '..', 'cschoolexam', 'build'),
+    path.join(__dirname, '..', '..', 'cschoolexam', 'build')
+], 'index.html');
+
+if (frontendBuild) {
+    app.use(express.static(frontendBuild));
+}
+
+// ===================================================================
+// *** SPA ROUTES — browser navigations to frontend pages ***
+// ===================================================================
+const SPA_ROUTES = ['/login', '/admin', '/teacher', '/student', '/register'];
+if (frontendBuild) {
+    app.use((req, res, next) => {
+        if (req.method === 'GET' && (req.headers.accept || '').includes('text/html')) {
+            const matchesSpa = SPA_ROUTES.some(r => req.path === r || req.path.startsWith(r + '/'));
+            if (matchesSpa) {
+                return res.sendFile(path.join(frontendBuild, 'index.html'));
+            }
+        }
+        next();
+    });
+}
+
+// ===================================================================
 // ✅ HEALTH CHECK ROUTE — registered BEFORE all API mounts (especially
 //    app.use('/api', analyticsRoutes)) so nothing can intercept it.
-//    Used by Network Settings.
+//    Reports the sync version so you can verify in the browser WHICH
+//    code is actually running. Used by Network Settings.
 // ===================================================================
 app.get('/api/health', (req, res) => {
-    res.status(200).json({ success: true, status: 'ok', message: 'Server is online' });
+    res.status(200).json({
+        success: true,
+        status: 'ok',
+        message: 'Server is online',
+        syncVersion: 'v4.1'
+    });
 });
 
 // ===================================================================
@@ -181,8 +215,13 @@ const scoreManagementRoutes = require('../routes/scoreManagementRoutes');
 const eNoteRoutes = require('../routes/eNoteRoutes');
 const resultPinRoutes = require('../routes/resultPinRoutes'); // ✅ Result PIN routes
 
-// NOTE: `syncRoutes` is no longer imported — the sync endpoint is now defined
-// inline below (pg_dump/pg_restore with real-time progress streaming).
+// ✅ SYNC ROUTE — lives in ../routes/syncRoutes.js (v4.1)
+//    Pre-flight schema check • strict exit codes • --single-transaction
+//    • unique temp dumps • concurrency guard • auto schema repair.
+//    All pg_dump/pg_restore/prisma logic is in that file, NOT here.
+//    (Replaces the old inline sync route — same endpoints:
+//      POST /sync/to-online  and  POST /sync/to-local)
+const syncRoutes = require('../routes/syncRoutes');
 
 // ===================================================================
 // *** 5. MOUNT ROUTES ***
@@ -232,175 +271,10 @@ app.use('/e-notes', eNoteRoutes);
 app.use('/admin/ca', adminCaRoutes);
 app.use('/admin/result-pins', resultPinRoutes);
 
-// ===================================================================
-// ✅ INLINE SYNC ROUTE (With Real-time Progress Streaming)
-// ✅ pg_dump / pg_restore auto-detected — bundled PostgreSQL
-//    (packaged .exe), repo-local portable build (dev), or machine
-//    install. No hardcoded paths.
-// (On Vercel this route returns a friendly 500 because the pg tools
-//  aren't bundled there — syncing actually runs on the local server.)
-// ===================================================================
-const getPGBinDir = () => {
-    // 1. Explicit override via .env (always wins if set)
-    if (process.env.PG_BIN_PATH) return process.env.PG_BIN_PATH;
-
-    // 2. Bundled with the packaged Electron app
-    //    (process.resourcesPath only exists inside Electron)
-    if (process.resourcesPath) {
-        const bundled = path.join(process.resourcesPath, 'postgres', 'bin');
-        if (fs.existsSync(path.join(bundled, 'pg_dump.exe'))) return bundled;
-    }
-
-    // 3. Repo-local portable PostgreSQL — covers both folder layouts
-    const localCandidates = [
-        path.join(__dirname, '..', 'resources', 'postgres', 'bin'),
-        path.join(__dirname, '..', '..', 'resources', 'postgres', 'bin')
-    ];
-    for (const dir of localCandidates) {
-        if (fs.existsSync(path.join(dir, 'pg_dump.exe'))) return dir;
-    }
-
-    // 4. Fall back to a machine install (plain dev machine)
-    return 'C:\\Program Files\\PostgreSQL\\18\\bin';
-};
-
-const PG_BIN_DIR = getPGBinDir();
-const PG_DUMP_PATH = path.join(PG_BIN_DIR, 'pg_dump.exe');
-const PG_RESTORE_PATH = path.join(PG_BIN_DIR, 'pg_restore.exe');
-console.log(`🛠️  PostgreSQL tools directory: ${PG_BIN_DIR}`);
-
-const parseConn = (urlStr) => {
-    const u = new URL(urlStr);
-    return {
-        host: u.hostname,
-        port: u.port || 5432,
-        user: u.username,
-        password: decodeURIComponent(u.password),
-        database: u.pathname.slice(1)
-    };
-};
-
-app.post('/sync/:direction', authenticateToken, async (req, res) => {
-    try {
-        if (!['admin', 'superadmin'].includes(req.user.role)) {
-            return res.status(403).json({ success: false, message: 'Access denied. Admins only.' });
-        }
-
-        const direction = req.params.direction;
-        const LOCAL_URL = process.env.DATABASE_URL;
-        const ONLINE_URL = process.env.ONLINE_DATABASE_URL;
-
-        if (!LOCAL_URL || !ONLINE_URL) {
-            return res.status(500).json({ success: false, message: 'Local or online database URL not configured.' });
-        }
-
-        // ✅ Fail fast with plain JSON if the pg tools are missing
-        if (!fs.existsSync(PG_DUMP_PATH) || !fs.existsSync(PG_RESTORE_PATH)) {
-            return res.status(500).json({
-                success: false,
-                message: `pg_dump/pg_restore not found in "${PG_BIN_DIR}". Bundle PostgreSQL in resources/postgres or set PG_BIN_PATH.`
-            });
-        }
-
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-
-        const sendEvent = (message) => {
-            res.write(`data: ${JSON.stringify({ message })}\n\n`);
-        };
-
-        const tempFile = path.join(os.tmpdir(), 'temp_sync.dump');
-        let sourceConn, targetConn;
-
-        if (direction === 'to-local') {
-            sourceConn = parseConn(ONLINE_URL);
-            targetConn = parseConn(LOCAL_URL);
-            sendEvent("Starting backup from Neon Cloud...");
-        } else if (direction === 'to-online') {
-            sourceConn = parseConn(LOCAL_URL);
-            targetConn = parseConn(ONLINE_URL);
-            sendEvent("Starting push from Local Database...");
-        } else {
-            return res.end();
-        }
-
-        const dumpArgs = [
-            `--host=${sourceConn.host}`,
-            `--port=${sourceConn.port}`,
-            `--username=${sourceConn.user}`,
-            `--dbname=${sourceConn.database}`,
-            `--format=c`,
-            `--file=${tempFile}`
-        ];
-
-        const dump = spawn(PG_DUMP_PATH, dumpArgs, { env: { ...process.env, PGPASSWORD: sourceConn.password } });
-
-        dump.stderr.on('data', (data) => {
-            const msg = data.toString();
-            if (!msg.includes('warning')) sendEvent(`Dumping: ${msg.trim()}`);
-        });
-
-        dump.on('error', (err) => {
-            sendEvent(`❌ Spawn Error: ${err.message}`);
-            res.end();
-        });
-
-        dump.on('close', (code) => {
-            if (code !== 0) {
-                sendEvent("❌ Error: Failed to dump database.");
-                if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-                return res.end();
-            }
-
-            sendEvent("✅ Dump complete. Starting restore...");
-
-            const restoreArgs = [
-                `--host=${targetConn.host}`,
-                `--port=${targetConn.port}`,
-                `--username=${targetConn.user}`,
-                `--dbname=${targetConn.database}`,
-                `--clean`,
-                `--if-exists`,
-                `--no-owner`,
-                `--no-privileges`,
-                tempFile
-            ];
-
-            const restore = spawn(PG_RESTORE_PATH, restoreArgs, { env: { ...process.env, PGPASSWORD: targetConn.password } });
-
-            restore.stderr.on('data', (data) => {
-                const msg = data.toString();
-                sendEvent(`Restore Log: ${msg.trim()}`);
-            });
-
-            restore.stdout.on('data', (data) => {
-                const msg = data.toString();
-                sendEvent(`Restore Log: ${msg.trim()}`);
-            });
-
-            restore.on('close', (code) => {
-                if (code === 0 || code === 1) {
-                    sendEvent("✅ Synchronization completed successfully!");
-                } else {
-                    sendEvent(`❌ Error: Failed to restore database. Exit code: ${code}`);
-                }
-                if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-                res.end();
-            });
-
-            restore.on('error', (err) => {
-                sendEvent(`❌ Spawn Error: ${err.message}`);
-                res.end();
-            });
-        });
-
-    } catch (error) {
-        console.error('Sync error:', error.message);
-        res.write(`data: ${JSON.stringify({ message: "❌ Server error" })}\n\n`);
-        res.end();
-    }
-});
+// ✅ SYNC — POST /sync/to-online and /sync/to-local
+//    (Was the inline pg_dump/pg_restore route with progress streaming —
+//    now served by the syncRoutes v4.1 module, exactly like server.js.)
+app.use('/sync', syncRoutes);
 
 // ✅ GENERIC ADMIN ROUTE (Must be mounted AFTER specific routes)
 app.use('/admin', adminUtilityRoutes);
@@ -414,6 +288,18 @@ app.use('/', broadsheetRoutes);
 app.use('/', adminCaManagementRoutes);
 app.use('/', adminScoresRoutes);
 app.use('/', scoreManagementRoutes);
+
+// ===================================================================
+// *** SPA FALLBACK — any unmatched GET that wants HTML gets the app ***
+// ===================================================================
+if (frontendBuild) {
+    app.use((req, res, next) => {
+        if (req.method === 'GET' && (req.headers.accept || '').includes('text/html')) {
+            return res.sendFile(path.join(frontendBuild, 'index.html'));
+        }
+        next();
+    });
+}
 
 // ===================================================================
 // *** 6. GLOBAL ERROR HANDLER ***
