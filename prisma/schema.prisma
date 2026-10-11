@@ -162,7 +162,9 @@ model Class {
   capacity            Int
   subjects            Int[]    // Array of Subject IDs
   students            Int[]    // Array of Student IDs
+  category            String?  // "primary" | "secondary" — null = uncategorized
   isActive            Boolean  @default(true)
+  
   
   resultAccessBlocked Boolean  @default(false)
   resultBlockReason   String   @default("")

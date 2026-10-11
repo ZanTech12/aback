@@ -1,5 +1,5 @@
 // routes/studentRoutes.js
-console.log('🔥 studentRoutes.js LOADED — GET / registered'); // remove after verifying
+console.log('🔥 studentRoutes.js LOADED — students + promotion + recycle-bin registered');
 
 const express = require('express');
 const router = express.Router();
@@ -9,23 +9,47 @@ const { authenticateToken, isTeacherOrAdmin, isAdmin } = require('../middlewares
 const ctrl = require('../controllers/studentController');
 
 // ===================================================================
-// *** STATIC ROUTES — registered BEFORE /:id ***
+// *** STATIC ROUTES — registered BEFORE /:id so nothing shadows them ***
 // ===================================================================
 
-// ✅ THE MISSING ROUTE — GET /students (list all students for this tenant)
+// GET /students — list all students for this tenant
 router.get('/', authenticateToken, isTeacherOrAdmin, ctrl.getStudents);
 
-// POST /students — register a new student (admission number auto-generated)
+// POST /students — register a new student (admission number auto-generated,
+// or honored as-is when provided by the CSV import)
 router.post('/', authenticateToken, isTeacherOrAdmin, ctrl.createStudent);
+
+// ===================================================================
+// *** PROMOTION ROUTES (static paths — MUST stay before /:id) ***
+// ===================================================================
+
+// POST /students/promotion/preview — dry-run the promotion plan (no changes)
+router.post('/promotion/preview', authenticateToken, isAdmin, ctrl.promotionPreview);
+
+// POST /students/promotion/execute — run the promotion (all-or-nothing transaction)
+router.post('/promotion/execute', authenticateToken, isAdmin, ctrl.promotionExecute);
+
+// ===================================================================
+// *** TEMPORARY: counter reset — hit once to repair a drifted
+//     currentStudentCount, then remove this route ***
+// ===================================================================
+router.post('/reset-counter', authenticateToken, isAdmin, ctrl.resetMyCounter);
+
+// ===================================================================
+// *** RECYCLE BIN — both path styles registered for frontend
+//     compatibility (your api file may call either form) ***
+// ===================================================================
 
 // GET /students/recycle-bin — list soft-deleted students (admin only)
 router.get('/recycle-bin', authenticateToken, isAdmin, ctrl.getRecycleBin);
 
-// PUT /students/restore/:id — restore from recycle bin (admin only)
+// Restore — PUT /restore/:id OR PATCH /recycle-bin/:id/restore (admin only)
 router.put('/restore/:id', authenticateToken, isAdmin, ctrl.restoreStudent);
+router.patch('/recycle-bin/:id/restore', authenticateToken, isAdmin, ctrl.restoreStudent);
 
-// DELETE /students/permanent/:id — permanently delete + clean up records (admin only)
+// Permanent delete — DELETE /permanent/:id OR DELETE /recycle-bin/:id/permanent
 router.delete('/permanent/:id', authenticateToken, isAdmin, ctrl.permanentDeleteStudent);
+router.delete('/recycle-bin/:id/permanent', authenticateToken, isAdmin, ctrl.permanentDeleteStudent);
 
 // ===================================================================
 // *** DYNAMIC ROUTES — registered LAST so /:id doesn't shadow statics ***
