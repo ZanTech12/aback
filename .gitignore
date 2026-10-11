@@ -9,7 +9,8 @@ uploads
 .claude
 .cursor
 .devin
-backend/api/index.js
-server.js
-/backend/server.js
+backend/api
+/backend/api
+
 .env
+/server.js
