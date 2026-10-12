@@ -12,7 +12,7 @@ const { authenticateToken } = require('../middlewares/authMiddleware');
 // Initialize Express App
 const app = express();
 
-// Helper — pick the first existing path. This file lives in /api, so we check
+// Helper — pick the first existing path. This file live in /api, so we check
 // both the "/api-relative" and "repo-root-relative" layouts. This lets the
 // same file work locally (LAN/desktop server) AND on Vercel.
 const firstExisting = (candidates, mustContain) =>
