@@ -600,17 +600,20 @@ exports.resetMyCounter = async (req, res) => {
 };
 
 // ==========================================
-// STUDENT PROMOTION (category-based)
+// STUDENT PROMOTION (category-based, with Primary 5 -> JSS 1 bridge)
 // ==========================================
 
-// Categories whose APEX class graduates to the recycle bin (the school exit).
-// Add 'primary' too if primary leavers should also exit to the recycle bin.
+// Category order defines the flow: each category's APEX promotes into the
+// NEXT category's entry class (Primary 5 -> JSS 1). The categories listed
+// in GRADUATING_CATEGORIES have their apex graduate to the recycle bin.
+const CATEGORY_ORDER = ['primary', 'secondary'];
 const GRADUATING_CATEGORIES = ['secondary'];
 
 // Per-category promotion rungs. Names are normalized before matching
 // (lowercase, spaces removed) so "SSS1" and "SSS 1" both match "sss1".
-// ⚠️ EDIT to match your school: remove the nursery rungs if you don't run
-// Nursery, or reorder if Nursery comes before KG in your school.
+// ⚠️ EDIT to match your school. To add Primary 6 in the future, add
+// { level: 10, names: ['primary6'] } — Primary 6 becomes the new apex and
+// bridges to JSS 1 automatically; nothing else changes.
 const CATEGORY_RUNGS = {
   primary: [
     { level: 1, names: ['kg1', 'kindergarten1'] },
@@ -621,15 +624,15 @@ const CATEGORY_RUNGS = {
     { level: 6, names: ['primary2'] },
     { level: 7, names: ['primary3'] },
     { level: 8, names: ['primary4'] },
-    { level: 9, names: ['primary5'] }    // APEX of Primary School — promotion STOPS
+    { level: 9, names: ['primary5'] }    // APEX of Primary — bridges to JSS 1
   ],
   secondary: [
-    { level: 1, names: ['jss1'] },
+    { level: 1, names: ['jss1'] },      // entry — receives the Primary 5 students
     { level: 2, names: ['jss2'] },
     { level: 3, names: ['jss3'] },
     { level: 4, names: ['sss1'] },
     { level: 5, names: ['sss2'] },
-    { level: 6, names: ['sss3'] }        // APEX of Secondary School — GRADUATES
+    { level: 6, names: ['sss3'] }       // APEX of Secondary — GRADUATES
   ]
 };
 
@@ -700,15 +703,58 @@ const buildPromotionPlan = async (adminId) => {
 
     // APEX of the category
     if (info.level === apexLevel(info.category)) {
+      // Apex of a graduating category -> recycle bin (the school exit)
       if (GRADUATING_CATEGORIES.includes(info.category)) {
         graduates.push({ className: label, students: classStudents });
-      } else {
-        apexStops.push({ className: label, category: info.category, count: classStudents.length });
+        continue;
       }
+
+      // ✅ BRIDGE: apex of a non-graduating category (Primary 5) promotes
+      // into the NEXT category's entry class (JSS 1)
+      const nextIndex = CATEGORY_ORDER.indexOf(info.category) + 1;
+      const nextCategory = nextIndex < CATEGORY_ORDER.length ? CATEGORY_ORDER[nextIndex] : null;
+
+      if (!nextCategory) {
+        apexStops.push({ className: label, category: info.category, count: classStudents.length, reason: 'apex of the last category - no bridge defined' });
+        continue;
+      }
+
+      const nextCatClasses = classInfo.filter(c => c.category === nextCategory);
+      if (nextCatClasses.length === 0) {
+        // School doesn't run the next category (e.g., primary-only school)
+        apexStops.push({
+          className: label, category: info.category, count: classStudents.length,
+          reason: `no ${nextCategory === 'primary' ? 'Primary' : 'Secondary'} School classes exist - students stay at the apex`
+        });
+        continue;
+      }
+
+      const entryLevel = (CATEGORY_RUNGS[nextCategory] || [])[0]?.level;
+      const targets = entryLevel !== undefined
+        ? nextCatClasses.filter(c => c.level === entryLevel)
+        : [];
+
+      if (targets.length === 0) {
+        apexStops.push({
+          className: label, category: info.category, count: classStudents.length,
+          reason: `the ${nextCategory === 'primary' ? 'Primary' : 'Secondary'} entry class ("${rungName(nextCategory, entryLevel)}") doesn't exist - create it first`
+        });
+        continue;
+      }
+
+      // Prefer the same section, else the first one
+      const target = targets.find(c => normClass(c.section) === normClass(info.section)) || targets[0];
+      moves.push({
+        category: info.category,
+        transition: true,   // marks the cross-category move (P5 -> JSS 1)
+        from: { id: info.id, label },
+        to: { id: target.id, label: `${target.name}${target.section ? ' - ' + target.section : ''}` },
+        students: classStudents
+      });
       continue;
     }
 
-    // Next class up — WITHIN the same category, never crosses categories
+    // Regular move: next rung up WITHIN the same category
     const targets = classInfo.filter(c => c.category === info.category && c.level === info.level + 1);
     if (targets.length === 0) {
       noTarget.push({ className: label, count: classStudents.length, missing: rungName(info.category, info.level + 1) });
@@ -724,16 +770,33 @@ const buildPromotionPlan = async (adminId) => {
     });
   }
 
-  // Entry class = lowest rung of primary (empties after promotion)
-  const entry = classInfo
-    .filter(c => c.category === 'primary' && c.level !== null)
-    .sort((a, b) => a.level - b.level)[0] || null;
+  // Entry classes = lowest existing rung of each category.
+  // A category's entry EMPTIES unless it receives transition students
+  // (JSS 1 receives the Primary 5 bridge, so it doesn't empty).
+  const transitionSources = new Map(); // targetCategory -> sourceCategory
+  for (const m of moves) {
+    if (!m.transition) continue;
+    const target = classById.get(m.to.id);
+    if (target) transitionSources.set(target.category, m.category);
+  }
+
+  const entryClasses = Object.keys(CATEGORY_RUNGS).map(cat => {
+    const lowest = classInfo
+      .filter(c => c.category === cat && c.level !== null)
+      .sort((a, b) => a.level - b.level)[0];
+    if (!lowest) return null;
+    return {
+      category: cat,
+      label: `${lowest.name}${lowest.section ? ' - ' + lowest.section : ''}`,
+      receivesTransition: transitionSources.get(cat) || null
+    };
+  }).filter(Boolean);
 
   return {
     totalStudents: students.length,
     unassignedCount: students.filter(s => !s.classId).length,
     moves, graduates, apexStops, noCategory, noTarget, unmatched,
-    entryClass: entry ? `${entry.name}${entry.section ? ' - ' + entry.section : ''}` : null
+    entryClasses
   };
 };
 
@@ -750,8 +813,15 @@ exports.promotionPreview = async (req, res) => {
       data: {
         totalStudents: plan.totalStudents,
         unassignedCount: plan.unassignedCount,
-        entryClass: plan.entryClass,
-        moveSummary: plan.moves.map(m => ({ category: m.category, from: m.from.label, to: m.to.label, count: m.students.length })),
+        entryClasses: plan.entryClasses,
+        moveSummary: plan.moves.map(m => ({
+          category: m.category,
+          transition: !!m.transition,
+          from: m.from.label,
+          to: m.to.label,
+          count: m.students.length
+        })),
+        transitionCount: plan.moves.filter(m => m.transition).reduce((sum, m) => sum + m.students.length, 0),
         graduateCount: plan.graduates.reduce((sum, g) => sum + g.students.length, 0),
         graduateClasses: plan.graduates.map(g => ({ className: g.className, count: g.students.length })),
         apexStops: plan.apexStops,
@@ -759,7 +829,7 @@ exports.promotionPreview = async (req, res) => {
         noCategory: plan.noCategory,
         noTarget: plan.noTarget,
         unmatched: plan.unmatched,
-        hasIssues: plan.noCategory.length > 0 || plan.noTarget.length > 0 || plan.unmatched.length > 0 || plan.unassignedCount > 0
+        hasIssues: plan.noCategory.length > 0 || plan.noTarget.length > 0 || plan.unmatched.length > 0 || plan.apexStops.length > 0 || plan.unassignedCount > 0
       }
     });
   } catch (error) {
@@ -778,14 +848,20 @@ exports.promotionExecute = async (req, res) => {
 
     const graduateIds = plan.graduates.flatMap(g => g.students.map(s => s.id));
     const movedCount = plan.moves.reduce((sum, m) => sum + m.students.length, 0);
+    const transitionCount = plan.moves.filter(m => m.transition).reduce((sum, m) => sum + m.students.length, 0);
     const apexStopCount = plan.apexStops.reduce((sum, a) => sum + a.count, 0);
 
     if (movedCount === 0 && graduateIds.length === 0) {
-      return res.json({ success: true, message: 'Nothing to promote - no active students in categorized classes.', data: { movedCount: 0, graduateCount: 0, apexStopCount: 0 } });
+      return res.json({
+        success: true,
+        message: 'Nothing to promote - no active students in categorized classes.',
+        data: { movedCount: 0, graduateCount: 0, transitionCount: 0, apexStopCount: 0 }
+      });
     }
 
     await prisma.$transaction(async (tx) => {
-      // 1. MOVE students up within their category
+      // 1. MOVE students up + across (transitions are ordinary moves here —
+      //    every student moves exactly once, computed from the same snapshot)
       for (const move of plan.moves) {
         await tx.student.updateMany({
           where: { id: { in: move.students.map(s => s.id) } },
@@ -805,7 +881,6 @@ exports.promotionExecute = async (req, res) => {
       }
 
       // 3. REBUILD every class's student array from the database
-      //    (apex-stop students stay in place automatically)
       const allClasses = await tx.class.findMany({ where: { adminId } });
       for (const cls of allClasses) {
         const newIds = (await tx.student.findMany({
@@ -822,16 +897,29 @@ exports.promotionExecute = async (req, res) => {
       await tx.admin.update({ where: { id: adminId }, data: { currentStudentCount: activeCount } });
     }, { timeout: 60000 });
 
+    const emptyNote = plan.entryClasses
+      .filter(e => !e.receivesTransition)
+      .map(e => `${e.label} is now empty for new intakes.`)
+      .join(' ');
+    const receiveNote = plan.entryClasses
+      .filter(e => e.receivesTransition)
+      .map(e => `${e.label} has received the ${e.receivesTransition === 'primary' ? 'Primary School' : 'Secondary School'} transition students.`)
+      .join(' ');
+
     res.json({
       success: true,
-      message: `Promotion complete: ${movedCount} student(s) moved up, ${graduateIds.length} graduated to the recycle bin.` +
-        (apexStopCount > 0 ? ` ${apexStopCount} student(s) stopped at the apex of their category (no automatic move).` : '') +
-        (plan.entryClass ? ` ${plan.entryClass} is now empty for new intakes.` : ''),
+      message: `Promotion complete: ${movedCount} student(s) moved up` +
+        (transitionCount > 0 ? ` (including ${transitionCount} crossing from Primary to Secondary)` : '') +
+        `, ${graduateIds.length} graduated to the recycle bin.` +
+        (apexStopCount > 0 ? ` ${apexStopCount} student(s) could not move - see the report.` : '') +
+        (emptyNote ? ` ${emptyNote}` : '') +
+        (receiveNote ? ` ${receiveNote}` : ''),
       data: {
         movedCount,
+        transitionCount,
         graduateCount: graduateIds.length,
         apexStopCount,
-        moveSummary: plan.moves.map(m => ({ category: m.category, from: m.from.label, to: m.to.label, count: m.students.length })),
+        moveSummary: plan.moves.map(m => ({ category: m.category, transition: !!m.transition, from: m.from.label, to: m.to.label, count: m.students.length })),
         graduateClasses: plan.graduates.map(g => ({ className: g.className, count: g.students.length })),
         apexStops: plan.apexStops,
         skipped: {
@@ -840,7 +928,7 @@ exports.promotionExecute = async (req, res) => {
           unmatched: plan.unmatched,
           unassigned: plan.unassignedCount
         },
-        entryClass: plan.entryClass
+        entryClasses: plan.entryClasses
       }
     });
   } catch (error) {
