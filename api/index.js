@@ -30,7 +30,8 @@ const allowedOrigins = process.env.CLIENT_URLS
         'https://www.fountainhillsschools.com.ng',
         'http://localhost:3000',
         'http://localhost:3001',
-        'http://localhost:5173'
+        'http://localhost:5173',
+        'https://datforte.bimtechsolutions.com.ng'
     ];
 
 const corsOptions = {
