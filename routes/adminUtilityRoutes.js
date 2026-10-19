@@ -8,6 +8,6 @@ router.post('/add-questionset-to-test', authenticateToken, ctrl.addQuestionSetTo
 router.post('/fix-all-tests', authenticateToken, ctrl.fixAllTests);
 router.post('/fix-test-dates', authenticateToken, ctrl.fixTestDates);
 router.post('/extend-all-tests', authenticateToken, ctrl.extendAllTests);
-router.post('/convert-questions', authenticateToken, ctrl.convertQuestions);
+//router.post('/convert-questions', authenticateToken, ctrl.convertQuestions);
 
 module.exports = router;
