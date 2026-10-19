@@ -157,31 +157,77 @@ exports.convertQuestions = async (req, res) => {
             baseURL: 'https://api.groq.com/openai/v1'
         });
 
-        const response = await groq.chat.completions.create({
-            // ✅ FIX: Use openai/gpt-oss-120b
-            model: 'openai/gpt-oss-120b',
-            messages: [
-                {
-                    role: 'system',
-                    content: 'You are an AI assistant that converts raw text into a JSON array of multiple-choice questions. The output must be an array of objects with the following keys: "questionText" (string), "options" (array of strings), "correctAnswer" (integer index of the correct option, 0-indexed), "difficulty" (string: "easy", "medium", "hard"), "explanation" (string). You can process up to 40 questions per request — if the input contains more than 40, process only the first 40. You MUST preserve ALL mathematical symbols, special characters, and notation EXACTLY as they appear in the source text. This includes but is not limited to: √, ², ³, ⁿ, π, ∞, ∑, ∫, ÷, ×, ±, ≤, ≥, ≠, ≈, ∆, α, β, γ, θ, Ω, ∠, ∥, ⊥, ≅, ∈, ∉, ∪, ∩, ⊂, ⊃, ∅, superscripts, subscripts, fractions, and any Unicode mathematical operator or Greek letter. Do NOT translate symbols to words (e.g., keep "√9" as "√9", not "square root of 9"). Do NOT convert symbols to LaTeX unless they were already LaTeX in the source. Do NOT escape them with backslashes. Output them as literal UTF-8 characters inside the JSON string values. Only return the valid JSON array, no other text or markdown formatting.'
-                },
-                {
-                    role: 'user',
-                    content: `Convert the following text into the specified JSON format. Preserve all mathematical symbols exactly as written, do not modify or translate them:\n\n${rawText}`
+        // ✅ NEW: Pre-process — normalize single-line options "A. X B. Y C. Z D. W" → multi-line
+        const normalizedText = rawText.split('\n').map(line => {
+            // Match lines with multiple option markers like "A. ... B. ... C. ... D. ..."
+            const optionPattern = /([A-D]\.\s+[^A-D\n]+?)(?=\s+[A-D]\.\s+|$)/g;
+            const options = line.match(optionPattern);
+            if (options && options.length > 1) {
+                return options.map(o => o.trim()).join('\n');
+            }
+            return line;
+        }).join('\n');
+
+        // ✅ NEW: Split into chunks of 10 questions to avoid token truncation
+        const questionBlocks = normalizedText.split(/\n(?=\s*\d+\.\s)/).filter(b => b.trim());
+        const CHUNK_SIZE = 10;
+        const chunks = [];
+        for (let i = 0; i < questionBlocks.length; i += CHUNK_SIZE) {
+            chunks.push(questionBlocks.slice(i, i + CHUNK_SIZE).join('\n\n'));
+        }
+
+        const SYSTEM_PROMPT = 'You are an AI assistant that converts raw text into a JSON array of multiple-choice questions. The output must be an array of objects with the following keys: "questionText" (string), "options" (array of strings), "correctAnswer" (integer index of the correct option, 0-indexed), "difficulty" (string: "easy", "medium", "hard"), "explanation" (string). You can process up to 40 questions per request. You MUST preserve ALL mathematical symbols, phonetic notation (including slashes like /str/, /skr/), curly quotes (" "), em-dashes, hyphens, and any Unicode character EXACTLY as they appear in the source. Do NOT translate, escape, or modify them. If the correct answer is not marked in the source, infer it based on your knowledge. Keep explanations concise (1-2 sentences max). The ENTIRE response must be ONLY a valid JSON array — no markdown fences, no commentary, no preamble. Start with [ and end with ].';
+
+        // ✅ NEW: Process all chunks in parallel, with robust parsing
+        const chunkResults = await Promise.all(chunks.map(async (chunk, index) => {
+            try {
+                const response = await groq.chat.completions.create({
+                    model: 'openai/gpt-oss-120b',
+                    messages: [
+                        { role: 'system', content: SYSTEM_PROMPT },
+                        { role: 'user', content: `Convert the following text into the specified JSON format. Preserve all symbols exactly as written:\n\n${chunk}` }
+                    ],
+                    temperature: 0.1,
+                    max_tokens: 4000, // 10 questions × ~250 tokens each = plenty of room
+                });
+
+                let text = response.choices[0].message.content || '';
+                // Clean up markdown if present
+                text = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+                // Strip any preamble before the first [
+                const firstBracket = text.indexOf('[');
+                const lastBracket = text.lastIndexOf(']');
+                if (firstBracket > 0 || lastBracket < text.length - 1) {
+                    text = text.substring(firstBracket >= 0 ? firstBracket : 0, lastBracket + 1);
                 }
-            ],
-            temperature: 0.1,
-            max_tokens: 16000,
-        });
 
-        let text = response.choices[0].message.content;
-        
-        // Clean up markdown if present
-        text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+                const parsed = JSON.parse(text);
+                // Handle wrapped responses
+                if (Array.isArray(parsed)) return parsed;
+                if (parsed.questions && Array.isArray(parsed.questions)) return parsed.questions;
+                if (parsed.data && Array.isArray(parsed.data)) return parsed.data;
+                if (parsed.questions && Array.isArray(parsed.questions)) return parsed.questions;
+                return [parsed];
+            } catch (chunkError) {
+                console.error(`Chunk ${index + 1} failed:`, chunkError.message);
+                return [];
+            }
+        }));
 
-        res.status(200).json({ 
-            success: true, 
-            data: JSON.parse(text) 
+        // ✅ NEW: Flatten all chunk results into one array
+        const allQuestions = chunkResults.flat();
+
+        if (allQuestions.length === 0) {
+            return res.status(500).json({
+                success: false,
+                message: 'AI failed to parse any questions. Please check the input format and try again.'
+            });
+        }
+
+        res.status(200).json({
+            success: true,
+            count: allQuestions.length,
+            data: allQuestions
         });
     } catch (error) {
         console.error('Groq Convert Error:', error);
