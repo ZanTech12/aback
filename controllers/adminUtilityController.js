@@ -159,18 +159,19 @@ exports.convertQuestions = async (req, res) => {
 
         const response = await groq.chat.completions.create({
             // ✅ FIX: Use openai/gpt-oss-120b
-            model: 'openai/gpt-oss-120b', 
+            model: 'openai/gpt-oss-120b',
             messages: [
                 {
                     role: 'system',
-                    content: 'You are an AI assistant that converts raw text into a JSON array of multiple-choice questions. The output must be an array of objects with the following keys: "questionText" (string), "options" (array of strings), "correctAnswer" (integer index of the correct option, 0-indexed), "difficulty" (string: "easy", "medium", "hard"), "explanation" (string). Only return the valid JSON array, no other text or markdown formatting.'
+                    content: 'You are an AI assistant that converts raw text into a JSON array of multiple-choice questions. The output must be an array of objects with the following keys: "questionText" (string), "options" (array of strings), "correctAnswer" (integer index of the correct option, 0-indexed), "difficulty" (string: "easy", "medium", "hard"), "explanation" (string). You can process up to 40 questions per request — if the input contains more than 40, process only the first 40. You MUST preserve ALL mathematical symbols, special characters, and notation EXACTLY as they appear in the source text. This includes but is not limited to: √, ², ³, ⁿ, π, ∞, ∑, ∫, ÷, ×, ±, ≤, ≥, ≠, ≈, ∆, α, β, γ, θ, Ω, ∠, ∥, ⊥, ≅, ∈, ∉, ∪, ∩, ⊂, ⊃, ∅, superscripts, subscripts, fractions, and any Unicode mathematical operator or Greek letter. Do NOT translate symbols to words (e.g., keep "√9" as "√9", not "square root of 9"). Do NOT convert symbols to LaTeX unless they were already LaTeX in the source. Do NOT escape them with backslashes. Output them as literal UTF-8 characters inside the JSON string values. Only return the valid JSON array, no other text or markdown formatting.'
                 },
                 {
                     role: 'user',
-                    content: `Convert the following text into the specified JSON format:\n\n${rawText}`
+                    content: `Convert the following text into the specified JSON format. Preserve all mathematical symbols exactly as written, do not modify or translate them:\n\n${rawText}`
                 }
             ],
             temperature: 0.1,
+            max_tokens: 16000,
         });
 
         let text = response.choices[0].message.content;
