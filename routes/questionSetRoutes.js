@@ -8,7 +8,7 @@ router.route('/')
    // .post(authenticateToken, isTeacherOrAdmin, ctrl.createQuestionSet);
 
 router.route('/:id')
-    .put(authenticateToken, isTeacherOrAdmin, ctrl.updateQuestionSet)
+    //.put(authenticateToken, isTeacherOrAdmin, ctrl.updateQuestionSet)
     .delete(authenticateToken, isTeacherOrAdmin, ctrl.deleteQuestionSet);
 
 module.exports = router;
