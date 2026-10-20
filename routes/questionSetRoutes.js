@@ -5,7 +5,7 @@ const ctrl = require('../controllers/questionSetController');
 
 router.route('/')
     .get(authenticateToken, isTeacherOrAdmin, ctrl.getQuestionSets)
-    .post(authenticateToken, isTeacherOrAdmin, ctrl.createQuestionSets);
+   // .post(authenticateToken, isTeacherOrAdmin, ctrl.createQuestionSet);
 
 router.route('/:id')
     .put(authenticateToken, isTeacherOrAdmin, ctrl.updateQuestionSet)
