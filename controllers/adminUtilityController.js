@@ -138,7 +138,11 @@ exports.extendAllTests = async (req, res) => {
 };
 
 // ===================================================================
-// ✅ NEW: BULK QUESTION CONVERTER (Google Gemini AI)
+// ✅ BULK QUESTION CONVERTER (Google Gemini AI)
+// Supports TWO input formats simultaneously:
+//   Format A (old): "1. Question" with options "A. X B. Y C. Z D. W"
+//   Format B (new): "(1) Question" with options "(A) X (B) Y (C) Z (D) W"
+// Also strips [cite: XX] markers and handles markdown bold (**1.**)
 // ===================================================================
 // POST /admin/convert-questions
 exports.convertQuestions = async (req, res) => {
@@ -156,17 +160,25 @@ exports.convertQuestions = async (req, res) => {
             baseURL: 'https://api.groq.com/openai/v1'
         });
 
-        // ✅ NEW: Pre-process — normalize text
-        // 1. Filter out horizontal rule lines (---) that separate questions
-        // 2. Strip markdown bold around question numbers: "**1.**" → "1."
-        // 3. Normalize single-line options "A. X B. Y" OR "(A) X (B) Y" → multi-line
+        // ──────────────────────────────────────────────────────────────
+        // ✅ Pre-process — normalize text (handles BOTH formats)
+        // ──────────────────────────────────────────────────────────────
         const normalizedText = rawText
+            // Step 1: Strip [cite: XX] markers (e.g., [cite: 19], [cite: 20])
+            .replace(/\[cite:\s*\d+\]/g, '')
             .split('\n')
-            .filter(line => !/^\s*-{3,}\s*$/.test(line.trim()))   // remove "---" rules
-            .map(line => line.replace(/^(\s*)\*+\s*(\d+\.)\s*\*+\s+/, '$1$2 ')) // **1.** → 1.
+            // Step 2: Filter out horizontal rule lines (---)
+            .filter(line => !/^\s*-{3,}\s*$/.test(line.trim()))
+            // Step 3: Strip markdown bold around question numbers: "**1.**" → "1."
+            .map(line => line.replace(/^(\s*)\*+\s*(\d+\.)\s*\*+\s+/, '$1$2 '))
+            // Step 4: Normalize single-line options to multi-line
+            // Handles BOTH formats:
+            //   Format A: "A. X B. Y C. Z D. W"  (dot style)
+            //   Format B: "(A) X (B) Y (C) Z (D) W"  (parens style)
             .map(line => {
-                // Match lines with multiple option markers: "A. ... B. ..." OR "(A) ... (B) ..."
-                const optionPattern = /(\(?\b[A-D]\b\)?\.?\s+[^A-D\n]+?)(?=\s+\(?\b[A-D]\b\)?\.?\s+|$)/g;
+                // Pattern matches an option marker (with or without parens, with or without dot)
+                // followed by content until the next option marker or end of line
+                const optionPattern = /(\(?\b[A-D]\b\)?\.?\s*)[^A-D\n]+?(?=\s*\(?\b[A-D]\b\)?\.?\s+|$)/g;
                 const options = line.match(optionPattern);
                 if (options && options.length > 1) {
                     return options.map(o => o.trim()).join('\n');
@@ -175,10 +187,16 @@ exports.convertQuestions = async (req, res) => {
             })
             .join('\n');
 
-        // ✅ NEW: Split into chunks of 10 questions to avoid token truncation
-        // Handles "1." and "**1.**" (markdown bold) formats — \** matches 0..N asterisks
+        // ──────────────────────────────────────────────────────────────
+        // ✅ Split into chunks of 10 questions
+        // Handles ALL these formats:
+        //   "1. Question"          (Format A — dot)
+        //   "**1.** Question"      (Format A — markdown bold)
+        //   "(1) Question"         (Format B — parens)
+        //   "**(1)** Question"     (Format B — markdown bold parens, rare)
+        // ──────────────────────────────────────────────────────────────
         const questionBlocks = normalizedText
-            .split(/\n(?=\s*\**\s*\d+\.\s*\**\s)/)
+            .split(/\n(?=\s*\**\s*(?:\(\d+\)|\d+\.)\s*\**\s*)/)
             .filter(b => b.trim());
 
         const CHUNK_SIZE = 10;
@@ -189,7 +207,9 @@ exports.convertQuestions = async (req, res) => {
 
         const SYSTEM_PROMPT = 'You are an AI assistant that converts raw text into a JSON array of multiple-choice questions. The output must be an array of objects with the following keys: "questionText" (string), "options" (array of strings), "correctAnswer" (integer index of the correct option, 0-indexed), "difficulty" (string: "easy", "medium", "hard"), "explanation" (string). You can process up to 40 questions per request. You MUST preserve ALL mathematical symbols, LaTeX notation (e.g. $x^2$, \\frac{a}{b}, \\log_7, \\dots, \\pm, \\times, \\left, \\right), phonetic notation (including slashes like /str/, /skr/), curly quotes (" "), em-dashes, hyphens, currency symbols (e.g. ₦), and any Unicode character EXACTLY as they appear in the source. Do NOT translate, escape, or modify them. The "questionText" should contain the question only (e.g. "Given: 2 + 4 + 6 + ... + 20. Find number of terms."), and "options" must contain the option text only (e.g. "10", "$\\pm 11$") WITHOUT the "(A)"/"A." prefix. If the correct answer is not marked in the source, infer it based on your knowledge. Keep explanations concise (1-2 sentences max). The ENTIRE response must be ONLY a valid JSON array — no markdown fences, no commentary, no preamble. Start with [ and end with ].';
 
-        // ✅ NEW: Process all chunks in parallel, with robust parsing
+        // ──────────────────────────────────────────────────────────────
+        // ✅ Process all chunks in parallel, with robust parsing
+        // ──────────────────────────────────────────────────────────────
         const chunkResults = await Promise.all(chunks.map(async (chunk, index) => {
             try {
                 const response = await groq.chat.completions.create({
